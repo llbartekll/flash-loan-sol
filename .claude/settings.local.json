@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(export*)",
+      "Bash(source*)",
+      "Bash(forge*)",
+      "Bash(cast*)",
+      "Bash(anvil*)",
+      "Bash(git*)",
+      "Bash(ls*)",
+      "Bash(cat*)",
+      "Bash(echo*)",
+      "Bash(mkdir*)",
+      "Bash(cp*)",
+      "Bash(mv*)",
+      "Bash(rm*)",
+      "Bash(grep*)",
+      "Bash(find*)",
+      "Bash(curl*)"
+    ]
+  }
+}
