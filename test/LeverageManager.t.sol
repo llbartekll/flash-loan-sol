@@ -139,6 +139,40 @@ contract LeverageManagerTest is ForkSetup {
         vm.stopPrank();
     }
 
+    function test_leverageUp_reverts_invalidSlippage() public {
+        vm.startPrank(user);
+        ILeverageManager.LeverageParams memory params = ILeverageManager.LeverageParams({
+            collateralAsset: WETH,
+            debtAsset: USDC,
+            flashLoanAmount: 500e6,
+            swapPoolFee: FEE_500,
+            slippageBps: 10_001,
+            swapPath: ""
+        });
+        vm.expectRevert("LeverageManager: invalid slippage");
+        leverageManager.leverageUp(params);
+        vm.stopPrank();
+    }
+
+    function test_leverageUp_reverts_pathInputMismatch() public {
+        vm.startPrank(user);
+        // Starts with WETH, but leverage-up path must start with debtAsset (USDC)
+        bytes memory wrongPath = abi.encodePacked(WETH, FEE_500, USDC);
+
+        ILeverageManager.LeverageParams memory params = ILeverageManager.LeverageParams({
+            collateralAsset: WETH,
+            debtAsset: USDC,
+            flashLoanAmount: 500e6,
+            swapPoolFee: 0,
+            slippageBps: SLIPPAGE_100_BPS,
+            swapPath: wrongPath
+        });
+
+        vm.expectRevert("LeverageManager: path tokenIn mismatch");
+        leverageManager.leverageUp(params);
+        vm.stopPrank();
+    }
+
     // ──────────────────────────────────────────────
     // Deleverage Tests
     // ──────────────────────────────────────────────
@@ -221,6 +255,26 @@ contract LeverageManagerTest is ForkSetup {
         });
 
         vm.expectRevert();
+        leverageManager.deleverage(params);
+        vm.stopPrank();
+    }
+
+    function test_deleverage_reverts_pathOutputMismatch() public {
+        vm.startPrank(user);
+        // Ends with WETH, but deleverage path must end with debtAsset (USDC)
+        bytes memory wrongPath = abi.encodePacked(WETH, FEE_500, WETH);
+
+        ILeverageManager.DeleverageParams memory params = ILeverageManager.DeleverageParams({
+            collateralAsset: WETH,
+            debtAsset: USDC,
+            flashLoanAmount: 250e6,
+            collateralToWithdraw: 0.5 ether,
+            swapPoolFee: 0,
+            slippageBps: SLIPPAGE_100_BPS,
+            swapPath: wrongPath
+        });
+
+        vm.expectRevert("LeverageManager: path tokenOut mismatch");
         leverageManager.deleverage(params);
         vm.stopPrank();
     }

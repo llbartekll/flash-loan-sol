@@ -14,8 +14,9 @@ library SwapHelper {
         address tokenOut,
         uint24 fee,
         uint256 amountIn,
-        uint16 slippageBps
+        uint256 amountOutMinimum
     ) internal returns (uint256 amountOut) {
+        IERC20(tokenIn).safeApprove(address(router), 0);
         IERC20(tokenIn).safeApprove(address(router), amountIn);
 
         amountOut = router.exactInputSingle(
@@ -26,7 +27,7 @@ library SwapHelper {
                 recipient: address(this),
                 deadline: block.timestamp,
                 amountIn: amountIn,
-                amountOutMinimum: 0,
+                amountOutMinimum: amountOutMinimum,
                 sqrtPriceLimitX96: 0
             })
         );
@@ -36,14 +37,17 @@ library SwapHelper {
         ISwapRouter router,
         bytes memory path,
         uint256 amountIn,
-        uint16 slippageBps
+        uint256 amountOutMinimum
     ) internal returns (uint256 amountOut) {
+        require(path.length >= 43 && (path.length - 20) % 23 == 0, "SwapHelper: invalid path");
+
         // Extract tokenIn from the first 20 bytes of the path
         address tokenIn;
         assembly {
             tokenIn := div(mload(add(path, 0x20)), 0x1000000000000000000000000)
         }
 
+        IERC20(tokenIn).safeApprove(address(router), 0);
         IERC20(tokenIn).safeApprove(address(router), amountIn);
 
         amountOut = router.exactInput(
@@ -52,7 +56,7 @@ library SwapHelper {
                 recipient: address(this),
                 deadline: block.timestamp,
                 amountIn: amountIn,
-                amountOutMinimum: 0
+                amountOutMinimum: amountOutMinimum
             })
         );
     }

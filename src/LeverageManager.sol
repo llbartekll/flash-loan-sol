@@ -6,6 +6,7 @@ import {IPool} from "@aave/v3-core/contracts/interfaces/IPool.sol";
 import {IFlashLoanSimpleReceiver} from "@aave/v3-core/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol";
 import {DataTypes} from "@aave/v3-core/contracts/protocol/libraries/types/DataTypes.sol";
 import {ISwapRouter} from "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+import {IQuoter} from "@uniswap/v3-periphery/contracts/interfaces/IQuoter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
@@ -31,11 +32,16 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
     IPoolAddressesProvider public immutable override ADDRESSES_PROVIDER;
     IPool public immutable override POOL;
     ISwapRouter public immutable SWAP_ROUTER;
+    IQuoter public immutable QUOTER;
 
-    constructor(IPoolAddressesProvider addressesProvider, ISwapRouter swapRouter) {
+    constructor(IPoolAddressesProvider addressesProvider, ISwapRouter swapRouter, IQuoter quoter) {
+        require(address(addressesProvider) != address(0), "LeverageManager: invalid provider");
+        require(address(swapRouter) != address(0), "LeverageManager: invalid router");
+        require(address(quoter) != address(0), "LeverageManager: invalid quoter");
         ADDRESSES_PROVIDER = addressesProvider;
         POOL = IPool(addressesProvider.getPool());
         SWAP_ROUTER = swapRouter;
+        QUOTER = quoter;
     }
 
     // ──────────────────────────────────────────────
@@ -43,6 +49,15 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
     // ──────────────────────────────────────────────
 
     function leverageUp(LeverageParams calldata params) external nonReentrant {
+        _validateCommonParams(
+            params.collateralAsset, params.debtAsset, params.flashLoanAmount, params.slippageBps
+        );
+        if (params.swapPath.length > 0) {
+            _validatePath(params.swapPath, params.debtAsset, params.collateralAsset);
+        } else {
+            require(params.swapPoolFee > 0, "LeverageManager: invalid pool fee");
+        }
+
         bytes memory cbData = abi.encode(
             CallbackData({
                 operation: Operation.LEVERAGE_UP,
@@ -60,6 +75,16 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
     }
 
     function deleverage(DeleverageParams calldata params) external nonReentrant {
+        _validateCommonParams(
+            params.collateralAsset, params.debtAsset, params.flashLoanAmount, params.slippageBps
+        );
+        require(params.collateralToWithdraw > 0, "LeverageManager: invalid withdraw amount");
+        if (params.swapPath.length > 0) {
+            _validatePath(params.swapPath, params.collateralAsset, params.debtAsset);
+        } else {
+            require(params.swapPoolFee > 0, "LeverageManager: invalid pool fee");
+        }
+
         // aToken transfer happens inside the callback AFTER debt repayment
         // to avoid health factor revert when withdrawing all collateral
 
@@ -94,6 +119,7 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
         require(initiator == address(this), "LeverageManager: initiator must be this contract");
 
         CallbackData memory data = abi.decode(params, (CallbackData));
+        require(asset == data.debtAsset, "LeverageManager: callback asset mismatch");
 
         if (data.operation == Operation.LEVERAGE_UP) {
             _executeLeverageUp(data, asset, amount, premium);
@@ -128,12 +154,13 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
         // 1. Swap debtAsset → collateralAsset
         uint256 collateralReceived;
         if (data.swapPath.length > 0) {
-            collateralReceived = SWAP_ROUTER.exactInput(
-                data.swapPath, amount, data.slippageBps
-            );
+            uint256 minOut = _quoteMinOutPath(data.swapPath, amount, data.slippageBps);
+            collateralReceived = SWAP_ROUTER.exactInput(data.swapPath, amount, minOut);
         } else {
+            uint256 minOut =
+                _quoteMinOutSingle(asset, data.collateralAsset, data.swapPoolFee, amount, data.slippageBps);
             collateralReceived = SWAP_ROUTER.exactInputSingle(
-                asset, data.collateralAsset, data.swapPoolFee, amount, data.slippageBps
+                asset, data.collateralAsset, data.swapPoolFee, amount, minOut
             );
         }
 
@@ -153,7 +180,7 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
         CallbackData memory data,
         address asset,
         uint256 amount,
-        uint256 premium
+        uint256
     ) internal {
         // 1. Repay user's debt with flash-borrowed tokens
         _forceApprove(asset, address(POOL), amount);
@@ -172,10 +199,14 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
 
         // 3. Swap collateralAsset → debtAsset to repay flash loan
         if (data.swapPath.length > 0) {
-            SWAP_ROUTER.exactInput(data.swapPath, collateralWithdrawn, data.slippageBps);
+            uint256 minOut = _quoteMinOutPath(data.swapPath, collateralWithdrawn, data.slippageBps);
+            SWAP_ROUTER.exactInput(data.swapPath, collateralWithdrawn, minOut);
         } else {
-            SWAP_ROUTER.exactInputSingle(
+            uint256 minOut = _quoteMinOutSingle(
                 data.collateralAsset, asset, data.swapPoolFee, collateralWithdrawn, data.slippageBps
+            );
+            SWAP_ROUTER.exactInputSingle(
+                data.collateralAsset, asset, data.swapPoolFee, collateralWithdrawn, minOut
             );
         }
 
@@ -197,5 +228,54 @@ contract LeverageManager is IFlashLoanSimpleReceiver, ILeverageManager, Reentran
         if (amount > 0) {
             IERC20(token).safeApprove(spender, amount);
         }
+    }
+
+    function _validateCommonParams(
+        address collateralAsset,
+        address debtAsset,
+        uint256 flashLoanAmount,
+        uint16 slippageBps
+    ) internal pure {
+        require(collateralAsset != address(0) && debtAsset != address(0), "LeverageManager: zero address");
+        require(collateralAsset != debtAsset, "LeverageManager: identical assets");
+        require(flashLoanAmount > 0, "LeverageManager: invalid flash amount");
+        require(slippageBps <= 10_000, "LeverageManager: invalid slippage");
+    }
+
+    function _quoteMinOutPath(bytes memory path, uint256 amountIn, uint16 slippageBps)
+        internal
+        returns (uint256 minOut)
+    {
+        uint256 quotedOut = QUOTER.quoteExactInput(path, amountIn);
+        minOut = (quotedOut * (10_000 - slippageBps)) / 10_000;
+    }
+
+    function _quoteMinOutSingle(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint16 slippageBps
+    ) internal returns (uint256 minOut) {
+        uint256 quotedOut = QUOTER.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+        minOut = (quotedOut * (10_000 - slippageBps)) / 10_000;
+    }
+
+    function _validatePath(bytes memory path, address expectedTokenIn, address expectedTokenOut)
+        internal
+        pure
+    {
+        require(path.length >= 43 && (path.length - 20) % 23 == 0, "LeverageManager: invalid path");
+
+        address tokenIn;
+        address tokenOut;
+        uint256 len = path.length;
+        assembly {
+            tokenIn := shr(96, mload(add(path, 32)))
+            tokenOut := shr(96, mload(add(add(path, 32), sub(len, 20))))
+        }
+
+        require(tokenIn == expectedTokenIn, "LeverageManager: path tokenIn mismatch");
+        require(tokenOut == expectedTokenOut, "LeverageManager: path tokenOut mismatch");
     }
 }
